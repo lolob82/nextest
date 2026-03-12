@@ -1,0 +1,439 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NatureMama Heritage E-commerce Backend - Complete order processing system'
+
+Parameters:
+  FromEmail:
+    Type: String
+    Description: 'Verified email address in SES for sending order confirmations'
+    Default: 'orders@naturemama.com'
+  
+  WebsiteDomain:
+    Type: String
+    Description: 'Your website domain for CORS configuration'
+    Default: 'https://your-website-domain.com'
+
+Resources:
+  # DynamoDB Table for Orders
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: NatureMamaOrders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderNumber
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderNumber
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: NatureMamaHeritage
+        - Key: Environment
+          Value: Production
+
+  # IAM Role for Lambda Function
+  OrderProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NatureMamaOrderProcessorRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrderProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda Function for Order Processing
+  OrderProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: NatureMamaOrderProcessor
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt OrderProcessorRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          FROM_EMAIL: !Ref FromEmail
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+          const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+          const { marshall } = require('@aws-sdk/util-dynamodb');
+
+          const dynamoClient = new DynamoDBClient({ region: 'us-east-1' });
+          const sesClient = new SESClient({ region: 'us-east-1' });
+
+          const corsHeaders = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+            'Access-Control-Allow-Methods': 'OPTIONS,POST,GET',
+            'Content-Type': 'application/json'
+          };
+
+          exports.handler = async (event) => {
+            console.log('Event received:', JSON.stringify(event, null, 2));
+
+            // Handle CORS preflight
+            if (event.httpMethod === 'OPTIONS') {
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({ message: 'CORS preflight successful' })
+              };
+            }
+
+            try {
+              // Parse request body
+              const orderData = JSON.parse(event.body);
+              console.log('Order data:', orderData);
+
+              // Validate required fields
+              if (!orderData.orderNumber || !orderData.customerInfo || !orderData.items) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({ error: 'Missing required order data' })
+                };
+              }
+
+              // Store order in DynamoDB
+              const dynamoParams = {
+                TableName: process.env.ORDERS_TABLE,
+                Item: marshall({
+                  orderNumber: orderData.orderNumber,
+                  customerInfo: orderData.customerInfo,
+                  items: orderData.items,
+                  total: orderData.total,
+                  orderDate: orderData.orderDate,
+                  status: 'confirmed',
+                  createdAt: new Date().toISOString()
+                })
+              };
+
+              await dynamoClient.send(new PutItemCommand(dynamoParams));
+              console.log('Order stored in DynamoDB');
+
+              // Generate email content
+              const emailHtml = generateOrderEmailHtml(orderData);
+              const emailText = generateOrderEmailText(orderData);
+
+              // Send confirmation email
+              const emailParams = {
+                Source: process.env.FROM_EMAIL,
+                Destination: {
+                  ToAddresses: [orderData.customerInfo.email]
+                },
+                Message: {
+                  Subject: {
+                    Data: `Order Confirmation - ${orderData.orderNumber} - NatureMama Heritage`,
+                    Charset: 'UTF-8'
+                  },
+                  Body: {
+                    Html: {
+                      Data: emailHtml,
+                      Charset: 'UTF-8'
+                    },
+                    Text: {
+                      Data: emailText,
+                      Charset: 'UTF-8'
+                    }
+                  }
+                }
+              };
+
+              await sesClient.send(new SendEmailCommand(emailParams));
+              console.log('Confirmation email sent');
+
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  success: true,
+                  orderNumber: orderData.orderNumber,
+                  message: 'Order processed successfully'
+                })
+              };
+
+            } catch (error) {
+              console.error('Error processing order:', error);
+              return {
+                statusCode: 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: 'Internal server error',
+                  message: error.message
+                })
+              };
+            }
+          };
+
+          function generateOrderEmailHtml(orderData) {
+            const itemsHtml = orderData.items.map(item => `
+              <tr style="border-bottom: 1px solid #e5e7eb;">
+                <td style="padding: 12px 0;">
+                  <div style="display: flex; align-items: center;">
+                    <img src="${item.image}" alt="${item.name}" style="width: 60px; height: 60px; object-fit: cover; border-radius: 8px; margin-right: 12px;">
+                    <div>
+                      <h4 style="margin: 0; font-size: 16px; font-weight: 600; color: #1f2937;">${item.name}</h4>
+                      <p style="margin: 4px 0 0 0; color: #6b7280; font-size: 14px;">Quantity: ${item.quantity}</p>
+                    </div>
+                  </div>
+                </td>
+                <td style="padding: 12px 0; text-align: right; font-weight: 600;">$${(item.price * item.quantity).toFixed(2)}</td>
+              </tr>
+            `).join('');
+
+            return `
+              <!DOCTYPE html>
+              <html>
+              <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Order Confirmation - NatureMama Heritage</title>
+              </head>
+              <body style="font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; line-height: 1.6; color: #374151; margin: 0; padding: 0; background-color: #f9fafb;">
+                <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
+                  <!-- Header -->
+                  <div style="background: linear-gradient(135deg, #16a34a 0%, #eab308 100%); padding: 40px 30px; text-align: center;">
+                    <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 16px;">
+                      <div style="width: 32px; height: 32px; background-color: rgba(255,255,255,0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-right: 12px;">
+                        🌿
+                      </div>
+                      <h1 style="color: #ffffff; font-size: 24px; font-weight: 700; margin: 0; font-family: 'Playfair Display', serif;">NatureMama Heritage</h1>
+                    </div>
+                    <h2 style="color: #ffffff; font-size: 28px; font-weight: 600; margin: 0;">Order Confirmed!</h2>
+                    <p style="color: rgba(255,255,255,0.9); font-size: 16px; margin: 8px 0 0 0;">Thank you for choosing natural wellness</p>
+                  </div>
+
+                  <!-- Content -->
+                  <div style="padding: 40px 30px;">
+                    <div style="text-align: center; margin-bottom: 32px;">
+                      <div style="background-color: #f3f4f6; border-radius: 12px; padding: 20px; display: inline-block;">
+                        <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 14px;">Order Number</p>
+                        <p style="margin: 0; font-family: 'Monaco', monospace; font-size: 24px; font-weight: 700; color: #16a34a;">${orderData.orderNumber}</p>
+                      </div>
+                    </div>
+
+                    <div style="margin-bottom: 32px;">
+                      <h3 style="color: #1f2937; font-size: 20px; font-weight: 600; margin: 0 0 16px 0; font-family: 'Playfair Display', serif;">Order Details</h3>
+                      <table style="width: 100%; border-collapse: collapse;">
+                        ${itemsHtml}
+                        <tr style="border-top: 2px solid #16a34a;">
+                          <td style="padding: 16px 0; font-size: 18px; font-weight: 700; color: #1f2937;">Total</td>
+                          <td style="padding: 16px 0; text-align: right; font-size: 20px; font-weight: 700; color: #16a34a;">$${orderData.total}</td>
+                        </tr>
+                      </table>
+                    </div>
+
+                    <div style="margin-bottom: 32px;">
+                      <h3 style="color: #1f2937; font-size: 20px; font-weight: 600; margin: 0 0 16px 0; font-family: 'Playfair Display', serif;">Shipping Address</h3>
+                      <div style="background-color: #f9fafb; border-radius: 8px; padding: 16px;">
+                        <p style="margin: 0; font-weight: 600; color: #1f2937;">${orderData.customerInfo.fullName}</p>
+                        <p style="margin: 4px 0 0 0; color: #6b7280;">${orderData.customerInfo.street} ${orderData.customerInfo.houseNumber}</p>
+                        <p style="margin: 4px 0 0 0; color: #6b7280;">${orderData.customerInfo.postalCode} ${orderData.customerInfo.city}</p>
+                        <p style="margin: 8px 0 0 0; color: #6b7280;">📧 ${orderData.customerInfo.email}</p>
+                        <p style="margin: 4px 0 0 0; color: #6b7280;">📞 ${orderData.customerInfo.phoneNumber}</p>
+                      </div>
+                    </div>
+
+                    <div style="background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%); border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 32px;">
+                      <h3 style="color: #1f2937; font-size: 18px; font-weight: 600; margin: 0 0 12px 0;">What's Next?</h3>
+                      <p style="margin: 0 0 16px 0; color: #6b7280;">We'll prepare your order with care and send you tracking information once it ships.</p>
+                      <div style="display: flex; justify-content: center; gap: 16px; flex-wrap: wrap;">
+                        <div style="text-align: center;">
+                          <div style="background-color: #16a34a; color: white; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; margin: 0 auto 8px;">📦</div>
+                          <p style="margin: 0; font-size: 12px; color: #6b7280;">Processing<br>1-2 days</p>
+                        </div>
+                        <div style="text-align: center;">
+                          <div style="background-color: #eab308; color: white; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; margin: 0 auto 8px;">🚚</div>
+                          <p style="margin: 0; font-size: 12px; color: #6b7280;">Shipping<br>3-5 days</p>
+                        </div>
+                        <div style="text-align: center;">
+                          <div style="background-color: #16a34a; color: white; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; margin: 0 auto 8px;">🏠</div>
+                          <p style="margin: 0; font-size: 12px; color: #6b7280;">Delivered<br>to your door</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- Footer -->
+                  <div style="background-color: #1f2937; padding: 30px; text-align: center;">
+                    <p style="color: #9ca3af; margin: 0 0 16px 0; font-size: 14px;">Questions about your order? We're here to help!</p>
+                    <p style="color: #9ca3af; margin: 0; font-size: 14px;">📧 hello@naturemama.com | 📞 +1 (555) 123-4567</p>
+                    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #374151;">
+                      <p style="color: #6b7280; margin: 0; font-size: 12px;">© 2026 NatureMama Heritage. All rights reserved.</p>
+                    </div>
+                  </div>
+                </div>
+              </body>
+              </html>
+            `;
+          }
+
+          function generateOrderEmailText(orderData) {
+            const itemsText = orderData.items.map(item => 
+              `${item.name} (Qty: ${item.quantity}) - $${(item.price * item.quantity).toFixed(2)}`
+            ).join('\n');
+
+            return `
+          ORDER CONFIRMATION - NATUREMAMA HERITAGE
+
+          Thank you for your order!
+
+          Order Number: ${orderData.orderNumber}
+          Order Date: ${new Date(orderData.orderDate).toLocaleDateString()}
+
+          ORDER DETAILS:
+          ${itemsText}
+
+          Total: $${orderData.total}
+
+          SHIPPING ADDRESS:
+          ${orderData.customerInfo.fullName}
+          ${orderData.customerInfo.street} ${orderData.customerInfo.houseNumber}
+          ${orderData.customerInfo.postalCode} ${orderData.customerInfo.city}
+          Email: ${orderData.customerInfo.email}
+          Phone: ${orderData.customerInfo.phoneNumber}
+
+          We'll send you tracking information once your order ships.
+
+          Questions? Contact us at hello@naturemama.com or +1 (555) 123-4567
+
+          Thank you for choosing NatureMama Heritage!
+            `;
+          }
+
+  # API Gateway
+  OrdersApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: NatureMamaOrdersAPI
+      Description: 'API for processing NatureMama Heritage orders'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ParentId: !GetAtt OrdersApi.RootResourceId
+      PathPart: orders
+
+  # API Gateway Method (POST)
+  OrdersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/${OrderProcessorFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # API Gateway Method (OPTIONS for CORS)
+  OrdersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # API Gateway Deployment
+  OrdersApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - OrdersMethod
+      - OrdersOptionsMethod
+    Properties:
+      RestApiId: !Ref OrdersApi
+      StageName: prod
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${OrdersApi}/*/POST/orders'
+
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL for order processing'
+    Value: !Sub 'https://${OrdersApi}.execute-api.us-east-1.amazonaws.com/prod/orders'
+    Export:
+      Name: NatureMamaApiEndpoint
+
+  DynamoDBTableName:
+    Description: 'DynamoDB table name for orders'
+    Value: !Ref OrdersTable
+    Export:
+      Name: NatureMamaOrdersTable
+
+  LambdaFunctionName:
+    Description: 'Lambda function name for order processing'
+    Value: !Ref OrderProcessorFunction
+    Export:
+      Name: NatureMamaOrderProcessor
