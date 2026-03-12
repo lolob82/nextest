@@ -9,7 +9,7 @@ const CompanyTimeline = () => {
       title: 'Family Tradition',
       description: 'A family passion for natural remedies passed down through generations in the French countryside.',
       icon: Heart,
-      image: 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80'
+      image: '/images/family-tradition.jpg'
     },
     {
       year: '2023',

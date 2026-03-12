@@ -3,6 +3,7 @@ import CompanyTimeline from '../components/CompanyTimeline';
 import MissionSection from '../components/MissionSection';
 import TeamSection from '../components/TeamSection';
 import LocationsMap from '../components/LocationsMap';
+import ProducersSection from '../components/ProducersSection';
 
 const About = () => {
   return (
@@ -29,6 +30,7 @@ const About = () => {
 
       <MissionSection />
       <CompanyTimeline />
+      <ProducersSection />
       <TeamSection />
       <LocationsMap />
     </div>
